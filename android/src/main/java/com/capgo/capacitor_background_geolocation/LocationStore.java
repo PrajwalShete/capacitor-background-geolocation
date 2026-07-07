@@ -2,6 +2,9 @@ package com.capgo.capacitor_background_geolocation;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import com.getcapacitor.Logger;
 import java.io.BufferedReader;
 import java.io.File;
@@ -10,6 +13,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -40,7 +44,25 @@ final class LocationStore {
     private static final String QUEUE_FILE = "capgo_bgloc_pending.jsonl";
     // ~2000 fixes ≈ 50 km of driving at a 25 m distance filter — a long dead zone.
     private static final int MAX_QUEUE_ENTRIES = 2000;
+    // The common offline case appends one line without reading the file. The
+    // expensive read-trim-rewrite only runs when the file crosses this size, so
+    // the queue can briefly overshoot MAX_QUEUE_ENTRIES before being trimmed back.
+    private static final long MAX_QUEUE_BYTES = 1024L * 1024L; // ~1 MB
+    // At trim time, shed fixes older than this. Guards the head-of-line case: a
+    // permanently 5xx-ing entry can otherwise wedge the queue forever. Consumers
+    // treat the odometer as distance ground truth, so day-old points are useless.
+    private static final long MAX_QUEUE_AGE_MS = 24L * 60L * 60L * 1000L; // 24 h
+    private static final int HTTP_TIMEOUT_MS = 10000;
     private static final Object QUEUE_LOCK = new Object();
+
+    // Threading contract:
+    //   * deliverLocation / flushQueue / queueLocation are invoked ONLY from the
+    //     service's single-thread postExecutor, so they never run concurrently
+    //     with one another — appends and flushes are naturally serialized.
+    //   * clear() is the one exception: it runs on the main thread (via stop()).
+    //   * QUEUE_LOCK guards every file mutation so clear() can safely race the
+    //     executor. flushQueue deliberately performs its network POSTs OUTSIDE
+    //     the lock so a main-thread clear() never blocks behind a slow request.
 
     private LocationStore() {}
 
@@ -101,6 +123,15 @@ final class LocationStore {
         if (urlString == null || urlString.isEmpty()) {
             return;
         }
+        // Fast path: when there is clearly no connectivity, skip the network
+        // attempt entirely (which would otherwise stall for the full connect +
+        // read timeout) and buffer the fix in milliseconds. Under a sustained
+        // dead zone this keeps the postExecutor from building an unbounded
+        // backlog of doomed, timeout-bound tasks.
+        if (!isConnected(context)) {
+            queueLocation(context, urlString, data);
+            return;
+        }
         boolean pathClear = flushQueue(context);
         if (!pathClear || !attemptPost(urlString, data)) {
             queueLocation(context, urlString, data);
@@ -112,31 +143,57 @@ final class LocationStore {
      * (still offline). Returns true when the queue is empty afterwards.
      */
     static boolean flushQueue(Context context) {
+        // Snapshot the queue under the lock, then release it for the (slow)
+        // network phase — see the threading contract above. This is safe because
+        // only the postExecutor thread appends, so `lines` cannot change beneath
+        // us while we post; the sole concurrent mutator is clear(), which just
+        // deletes the file (handled when we re-acquire the lock to rewrite).
+        List<String> lines;
         synchronized (QUEUE_LOCK) {
             File file = queueFile(context);
             if (!file.exists()) {
                 return true;
             }
-            List<String> lines = readLines(file);
-            int handled = 0;
-            for (String line : lines) {
-                String url;
-                JSONObject body;
-                try {
-                    JSONObject entry = new JSONObject(line);
-                    url = entry.getString("url");
-                    body = entry.getJSONObject("body");
-                } catch (Exception e) {
-                    handled++; // corrupt line — drop it
-                    continue;
-                }
-                if (!attemptPost(url, body)) {
-                    break; // still offline/transient — keep this one and the rest
-                }
-                handled++;
-            }
-            if (handled == 0) {
+            // No connectivity: don't burn a per-entry timeout confirming what we
+            // already know. Leave the queue intact for the next attempt.
+            if (!isConnected(context)) {
                 return false;
+            }
+            lines = readLines(file);
+            if (lines.isEmpty()) {
+                //noinspection ResultOfMethodCallIgnored
+                file.delete();
+                return true;
+            }
+        }
+
+        int handled = 0;
+        for (String line : lines) {
+            String url;
+            JSONObject body;
+            try {
+                JSONObject entry = new JSONObject(line);
+                url = entry.getString("url");
+                body = entry.getJSONObject("body");
+            } catch (Exception e) {
+                handled++; // corrupt line — drop it
+                continue;
+            }
+            if (!attemptPost(url, body)) {
+                break; // still offline/transient — keep this one and the rest
+            }
+            handled++;
+        }
+        if (handled == 0) {
+            return false;
+        }
+
+        synchronized (QUEUE_LOCK) {
+            File file = queueFile(context);
+            if (!file.exists()) {
+                // clear() ran while we were posting (the trip was stopped): the
+                // queue is intentionally gone, so drop the un-posted remainder.
+                return true;
             }
             List<String> remaining = lines.subList(handled, lines.size());
             if (remaining.isEmpty()) {
@@ -157,17 +214,80 @@ final class LocationStore {
                 entry.put("url", url);
                 entry.put("body", body);
                 File file = queueFile(context);
-                List<String> lines = file.exists() ? readLines(file) : new ArrayList<>();
-                lines.add(entry.toString());
-                // Bounded: shed the OLDEST fixes beyond the cap. Consumers keep the
-                // odometer as distance ground truth, so ancient points matter least.
-                if (lines.size() > MAX_QUEUE_ENTRIES) {
-                    lines = new ArrayList<>(lines.subList(lines.size() - MAX_QUEUE_ENTRIES, lines.size()));
+                // Common case: append one line without reading the whole file.
+                // A 2000-entry queue would otherwise cost a ~500 KB read+rewrite
+                // per fix while offline; appending is O(1).
+                appendLine(file, entry.toString());
+                // Only pay the read-trim-rewrite when the file has actually grown
+                // large. length() is a cheap stat, checked on every append.
+                if (file.length() > MAX_QUEUE_BYTES) {
+                    trimQueue(file);
                 }
-                writeLines(file, lines);
             } catch (Exception e) {
                 Logger.error("Could not queue location for retry", e);
             }
+        }
+    }
+
+    // Appends a single line to the queue file, creating it if needed. Caller
+    // holds QUEUE_LOCK.
+    private static void appendLine(File file, String line) throws IOException {
+        try (FileOutputStream out = new FileOutputStream(file, true)) {
+            out.write(line.getBytes(StandardCharsets.UTF_8));
+            out.write('\n');
+        }
+    }
+
+    // Bounds the queue two ways: drops fixes older than MAX_QUEUE_AGE_MS (which
+    // also unwedges a head-of-line entry the server keeps 5xx-ing), then sheds
+    // the OLDEST fixes beyond MAX_QUEUE_ENTRIES. Caller holds QUEUE_LOCK.
+    private static void trimQueue(File file) {
+        List<String> lines = readLines(file);
+        long cutoff = System.currentTimeMillis() - MAX_QUEUE_AGE_MS;
+        List<String> kept = new ArrayList<>(lines.size());
+        for (String line : lines) {
+            if (!isExpired(line, cutoff)) {
+                kept.add(line);
+            }
+        }
+        if (kept.size() > MAX_QUEUE_ENTRIES) {
+            kept = new ArrayList<>(kept.subList(kept.size() - MAX_QUEUE_ENTRIES, kept.size()));
+        }
+        if (kept.size() != lines.size()) {
+            Logger.debug("Location queue trimmed: " + lines.size() + " -> " + kept.size() + " entries");
+        }
+        writeLines(file, kept);
+    }
+
+    // True when the entry's captured fix time is older than the cutoff. Unparseable
+    // or timeless lines are kept here and left for the normal drain/drop path.
+    private static boolean isExpired(String line, long cutoff) {
+        try {
+            long time = new JSONObject(line).getJSONObject("body").optLong("time", 0L);
+            return time > 0L && time < cutoff;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // Best-effort connectivity check. Returns true when unknown (no permission /
+    // no service) so we never wrongly skip a delivery that could have succeeded —
+    // a false "connected" just falls through to attemptPost, which handles the
+    // resulting IOException as a normal transient failure.
+    private static boolean isConnected(Context context) {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return true;
+            }
+            Network network = cm.getActiveNetwork();
+            if (network == null) {
+                return false;
+            }
+            NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+            return caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (Exception e) {
+            return true;
         }
     }
 
@@ -188,6 +308,11 @@ final class LocationStore {
             // retrying can never succeed.
             Logger.error("Location POST rejected permanently with " + code + "; dropping fix");
             return true;
+        } catch (MalformedURLException e) {
+            // A bad url can never become valid — retrying would loop forever and
+            // head-of-line-block every fix behind it. Drop it.
+            Logger.error("Location POST url is malformed; dropping fix", e);
+            return true;
         } catch (IOException e) {
             return false;
         }
@@ -202,8 +327,11 @@ final class LocationStore {
             byte[] body = data.toString().getBytes(StandardCharsets.UTF_8);
             connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod("POST");
-            connection.setConnectTimeout(15000);
-            connection.setReadTimeout(15000);
+            // 10s (was 15s): with the offline fast path most stalls are now brief
+            // radio flaps, not dead zones, so a shorter ceiling frees the executor
+            // and the mobile radio sooner while still tolerating a slow handshake.
+            connection.setConnectTimeout(HTTP_TIMEOUT_MS);
+            connection.setReadTimeout(HTTP_TIMEOUT_MS);
             connection.setDoOutput(true);
             connection.setRequestProperty("Accept", "application/json");
             connection.setRequestProperty("Content-Type", "application/json");
