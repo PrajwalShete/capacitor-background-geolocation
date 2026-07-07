@@ -119,6 +119,12 @@ public class BackgroundGeolocationService extends Service {
             requestLocationUpdates();
             startWatchdog();
         }
+        // The process may have died mid-dead-zone: push any buffered fixes now
+        // that we're alive again (no-op when the queue is empty).
+        if (postExecutor == null) {
+            postExecutor = Executors.newSingleThreadExecutor();
+        }
+        postExecutor.execute(() -> LocationStore.flushQueue(context));
         return START_STICKY;
     }
 
@@ -248,13 +254,9 @@ public class BackgroundGeolocationService extends Service {
         }
         Context context = getApplicationContext();
         JSONObject payload = locationToJson(location);
-        postExecutor.execute(() -> {
-            try {
-                LocationStore.sendLocation(context, payload);
-            } catch (Exception e) {
-                Logger.error("Native location POST failed", e);
-            }
-        });
+        // deliverLocation drains the offline backlog first, then posts this fix,
+        // buffering it on transient failure — dead zones lose nothing.
+        postExecutor.execute(() -> LocationStore.deliverLocation(context, payload));
     }
 
     private static JSONObject locationToJson(android.location.Location location) {
