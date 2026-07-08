@@ -20,6 +20,16 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name="com.capgo.capacitor_background_geolocation.LocationWatcherBootReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
